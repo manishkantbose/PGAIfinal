@@ -51,7 +51,7 @@ if not GROQ_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==============================================================================
-# 2. MASTER CATALOGS
+# 2. MASTER CATALOGS & THRESHOLDS
 # ==============================================================================
 EARLY_APPROVE_THRESH = 0.15
 EARLY_DECLINE_THRESH = 0.80
@@ -108,7 +108,7 @@ FIELD_LABELS = {
 }
 
 # ==============================================================================
-# 3. MOCK UNDERWRITING MODEL
+# 3. UNDERWRITING MODEL LOGIC
 # ==============================================================================
 @st.cache_resource
 def load_underwriting_model():
@@ -127,9 +127,6 @@ def load_underwriting_model():
 
 ml_model, MODEL_COLUMNS = load_underwriting_model()
 
-# ==============================================================================
-# 4. UNIFIED EXTRACTION & UNDERWRITING LOGIC
-# ==============================================================================
 def calculate_premium_score(model_desc: str) -> int:
     if not model_desc:
         return 0
@@ -173,8 +170,69 @@ def predict_risk(model, df_features: pd.DataFrame, model_columns: list) -> float
     aligned_df = df_features.reindex(columns=model_columns, fill_value=0).astype(np.float32)
     return float(model.predict_proba(aligned_df)[0][1])
 
+# ==============================================================================
+# 4. COUNTER-OFFER & REASON GENERATOR LOGIC
+# ==============================================================================
+def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
+    """Calculates maximum approved loan amount using binary search."""
+    req_loan = float(p1_data.get('requested_loan_amount', 0))
+    vehicle_price = float(p1_data.get('vehicle_price', 1))
+    low, high, max_approved = 0.0, req_loan, 0.0
+    
+    for _ in range(12):
+        mid = (low + high) / 2.0
+        test_p1 = p1_data.copy()
+        test_p1['requested_loan_amount'] = mid
+        df_feat = build_model_features(test_p1, p2_data)
+        risk = predict_risk(model, df_feat, MODEL_COLUMNS)
+        
+        if risk <= FINAL_DECISION_THRESH:
+            max_approved = mid
+            low = mid
+        else:
+            high = mid
+            
+    # Counter-offer condition: Eligible loan must be at least 30% of vehicle price & > ₹10,000
+    is_partial_possible = (max_approved >= (0.30 * vehicle_price)) and (max_approved >= 10000)
+    
+    return {
+        "requested_loan": req_loan,
+        "max_eligible_loan": max_approved,
+        "is_partial_possible": is_partial_possible
+    }
+
+def generate_decline_reasons(p1_data: dict, p2_data: dict) -> list:
+    """Identifies primary financial and demographic risk factors leading to decline."""
+    reasons = []
+    
+    req_loan = float(p1_data.get('requested_loan_amount', 0))
+    price = float(p1_data.get('vehicle_price', 1))
+    income = float(p2_data.get('monthly_income', 0))
+    emp_type = p2_data.get('Employment_Type', '')
+    
+    ltv = (req_loan / price) * 100 if price > 0 else 0
+
+    if income == 0:
+        reasons.append("Insufficient or unverified monthly income (₹0 reported)")
+    elif (req_loan / (income * 12 + 1)) > 3.0:
+        reasons.append("Requested loan amount is significantly high relative to annual income")
+        
+    if emp_type in ['STU', 'NONEARNMEM']:
+        reasons.append("Employment profile falls outside standard income-earning categories")
+        
+    if ltv > 80:
+        reasons.append(f"High Loan-to-Value (LTV) ratio of {ltv:.1f}% exceeds maximum standard limit")
+
+    if not reasons:
+        reasons.append("Overall credit risk score exceeded permissible underwriting policy limits")
+        
+    return reasons
+
+# ==============================================================================
+# 5. EXTRACTION & DIALOGUE HELPERS
+# ==============================================================================
 def extract_all_slots(user_input: str, current_state: dict) -> dict:
-    """Robust extraction logic handling Indian currency formats, typos, and historical state."""
+    """Robust slot extraction handling Indian formats and historical chat state."""
     system_prompt = f"""
     You are an AI loan entity extraction engine.
     Extract numbers accurately, especially from Indian currency inputs.
@@ -222,32 +280,8 @@ def extract_all_slots(user_input: str, current_state: dict) -> dict:
     except Exception:
         return {}
 
-def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
-    req_loan = p1_data['requested_loan_amount']
-    vehicle_price = p1_data['vehicle_price']
-    low, high, max_approved = 0.0, req_loan, 0.0
-    
-    for _ in range(12):
-        mid = (low + high) / 2.0
-        test_p1 = p1_data.copy()
-        test_p1['requested_loan_amount'] = mid
-        df_feat = build_model_features(test_p1, p2_data)
-        risk = predict_risk(model, df_feat, MODEL_COLUMNS)
-        
-        if risk <= FINAL_DECISION_THRESH:
-            max_approved = mid
-            low = mid
-        else:
-            high = mid
-            
-    return {
-        "requested_loan": req_loan,
-        "max_eligible_loan": max_approved,
-        "is_partial_possible": max_approved >= (0.30 * vehicle_price)
-    }
-
 def format_prompt_question(missing_mandatory: list, missing_optional: list) -> str:
-    """Generates prompt asking for mandatory items, with optional items encouraged in the same message."""
+    """Asks for missing mandatory items while encouraging optional ones in the same phrase."""
     mandatory_str = ", ".join([f"**{FIELD_LABELS[f]}**" for f in missing_mandatory])
     
     msg = f"To proceed with your application, please provide your {mandatory_str}."
@@ -259,12 +293,12 @@ def format_prompt_question(missing_mandatory: list, missing_optional: list) -> s
     return msg
 
 # ==============================================================================
-# 5. STATE MACHINE & PIPELINE ORCHESTRATOR
+# 6. PIPELINE ORCHESTRATION & STATE MACHINE
 # ==============================================================================
 def process_chat_message(user_input: str):
     state = st.session_state.chatbot_state
     
-    # Context-aware slot extraction
+    # Extract slots passing full accumulated state context
     extracted = extract_all_slots(user_input, {"p1": state["p1_data"], "p2": state["p2_data"]})
     
     p1_keys = ['requested_loan_amount', 'vehicle_price', 'Product_Code', 'Make_Code', 'Model_Variant', 'model_description']
@@ -290,11 +324,11 @@ def process_chat_message(user_input: str):
         missing_p1_mand = [f for f in p1_mandatory if p1_data.get(f) is None]
         missing_p1_opt = [f for f in p1_optional if p1_data.get(f) is None]
         
-        # IF mandatory is missing -> Ask for missing mandatory + encourage optional
+        # Ask if mandatory missing
         if missing_p1_mand:
             return format_prompt_question(missing_p1_mand, missing_p1_opt)
         
-        # IF mandatory IS present -> Move forward directly WITHOUT asking follow-ups!
+        # Mandatory fields present -> Proceed immediately without asking optional follow-ups
         p1_features = build_model_features(p1_data, p2_data)
         p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS)
         
@@ -304,7 +338,12 @@ def process_chat_message(user_input: str):
         elif p1_risk >= EARLY_DECLINE_THRESH:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             state["step"] = "COMPLETED"
-            return f"Thank you for applying. We cannot approve ₹{p1_data['requested_loan_amount']:,.0f}, but you are pre-approved for up to **₹{offer['max_eligible_loan']:,.0f}**."
+            if offer["is_partial_possible"]:
+                return f"Thank you for applying. We cannot approve ₹{p1_data['requested_loan_amount']:,.0f}, but you are pre-approved for up to **₹{offer['max_eligible_loan']:,.0f}**."
+            else:
+                reasons = generate_decline_reasons(p1_data, p2_data)
+                reasons_formatted = "\n".join([f"- {r}" for r in reasons])
+                return f"Thank you for applying. We are unable to approve your loan request of **₹{p1_data['requested_loan_amount']:,.0f}** at this time.\n\n**Primary Key Reason(s):**\n{reasons_formatted}"
         else:
             state["step"] = "PHASE_2_COLLECTION"
 
@@ -313,14 +352,13 @@ def process_chat_message(user_input: str):
     # --------------------------------------------------------------------------
     if state["step"] == "PHASE_2_COLLECTION":
         p2_mandatory = ['Employment_Type', 'monthly_income', 'age', 'pincode', 'has_active_loans']
-        
         missing_p2_mand = [f for f in p2_mandatory if p2_data.get(f) is None]
         
-        # IF Phase 2 mandatory fields are missing -> Prompt user
+        # Ask if mandatory missing
         if missing_p2_mand:
             return format_prompt_question(missing_p2_mand, missing_optional=[])
         
-        # IF Phase 2 mandatory fields ARE present -> Run full underwriting
+        # Mandatory fields present -> Execute full underwriting decision
         full_features = build_model_features(p1_data, p2_data)
         final_risk = predict_risk(ml_model, full_features, MODEL_COLUMNS)
         state["step"] = "COMPLETED"
@@ -331,10 +369,22 @@ def process_chat_message(user_input: str):
         else:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             max_l = offer["max_eligible_loan"]
+            
+            # Counter-offer provided if partial loan is viable
             if offer["is_partial_possible"]:
-                return f"Thank you for applying. While we cannot approve ₹{req:,.0f}, based on your profile you are pre-approved for up to **₹{max_l:,.0f}**. You can start a new application for this amount."
+                return (
+                    f"Thank you for applying. While we cannot approve **₹{req:,.0f}**, "
+                    f"based on your profile you are pre-approved for an eligible loan amount of up to **₹{max_l:,.0f}**."
+                )
             else:
-                return f"Thank you for applying. We are unable to approve your loan request of ₹{req:,.0f} at this time."
+                # Full decline with adverse action reasons
+                reasons = generate_decline_reasons(p1_data, p2_data)
+                reasons_formatted = "\n".join([f"- {r}" for r in reasons])
+                return (
+                    f"Thank you for applying. We are unable to approve your loan request of **₹{req:,.0f}** at this time.\n\n"
+                    f"**Primary Key Reason(s):**\n"
+                    f"{reasons_formatted}"
+                )
 
     return "Session complete."
 
@@ -345,7 +395,7 @@ def reset_application():
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
 
 # ==============================================================================
-# 6. UI LAYOUT & CHAT INTERFACE
+# 7. CHAT UI INTERFACE
 # ==============================================================================
 st.title("🚗 ABC Credit - Intelligent Loan Assistant")
 
