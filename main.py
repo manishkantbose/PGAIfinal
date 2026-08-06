@@ -7,7 +7,7 @@ from groq import Groq
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 # ==============================================================================
-# 1. PAGE SETUP & CONFIGURATION
+# 1. PAGE SETUP & CSS CHAT ALIGNMENT
 # ==============================================================================
 st.set_page_config(
     page_title="ABC Credit - Vehicle Loan Assistant",
@@ -15,15 +15,77 @@ st.set_page_config(
     layout="wide"
 )
 
-# Constants & Thresholds
+# Custom CSS to align User messages to the RIGHT and Bot messages to the LEFT
+st.markdown("""
+<style>
+    /* User chat bubble styling (Right Aligned) */
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+        flex-direction: row-reverse;
+        text-align: right;
+        background-color: #e8f5e9;
+        border-radius: 12px;
+        padding: 8px 12px;
+        margin-left: 20%;
+    }
+    
+    /* Assistant chat bubble styling (Left Aligned) */
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+        flex-direction: row;
+        text-align: left;
+        background-color: #f1f3f4;
+        border-radius: 12px;
+        padding: 8px 12px;
+        margin-right: 20%;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Fetch API Key from secrets
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("⚠️ GROQ_API_KEY not found in Streamlit Secrets! Please add it to `.streamlit/secrets.toml`.")
+    st.stop()
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ==============================================================================
+# 2. MASTER DATA CATALOGS (Including Variant & Pricing Ranges)
+# ==============================================================================
 EARLY_APPROVE_THRESH = 0.15
 EARLY_DECLINE_THRESH = 0.80
 FINAL_DECISION_THRESH = 0.44
 
+VARIANT_CATALOG = [
+    {"Make_Code": "RAIDER", "Model_Variant": "RAIDER", "Min": 114698, "Median": 118997, "Max": 130714},
+    {"Make_Code": "MOPEDS", "Model_Variant": "XL 100CC", "Min": 52515, "Median": 75027, "Max": 84301},
+    {"Make_Code": "APACHE", "Model_Variant": "160 DISC", "Min": 150542, "Median": 154555, "Max": 168522},
+    {"Make_Code": "NTORQ", "Model_Variant": "125 CC", "Min": 114845, "Median": 123306, "Max": 136088},
+    {"Make_Code": "JUPITER", "Model_Variant": "110 CC", "Min": 92559, "Median": 105592, "Max": 118442},
+    {"Make_Code": "SPORT", "Model_Variant": "SPORT", "Min": 73652, "Median": 75839, "Max": 89287},
+    {"Make_Code": "RADEON", "Model_Variant": "RADEON", "Min": 83145, "Median": 94395, "Max": 105997},
+    {"Make_Code": "JUPITER", "Model_Variant": "125 CC DISC", "Min": 109002, "Median": 118341, "Max": 127220},
+    {"Make_Code": "ZEST", "Model_Variant": "SCOOTY", "Min": 88000, "Median": 95596, "Max": 100705},
+    {"Make_Code": "TVS", "Model_Variant": "EBIKE", "Min": 144362, "Median": 154534, "Max": 170006},
+    {"Make_Code": "APACHE", "Model_Variant": "160 DRUM", "Min": 145911, "Median": 147830, "Max": 152054},
+    {"Make_Code": "JUPITER", "Model_Variant": "125CC DISC", "Min": 116827, "Median": 125844, "Max": 131851},
+    {"Make_Code": "JUPITER", "Model_Variant": "125 CC DRUM", "Min": 103997, "Median": 112992, "Max": 120617},
+    {"Make_Code": "CITY PLUS", "Model_Variant": "STAR CITY PLUS", "Min": 92904, "Median": 96257, "Max": 104998},
+    {"Make_Code": "RONIN", "Model_Variant": "RONIN", "Min": 179217, "Median": 202401, "Max": 220911},
+    {"Make_Code": "APACHE", "Model_Variant": "APACHE 180 CC", "Min": 160376, "Median": 162239, "Max": 170382},
+    {"Make_Code": "APACHE", "Model_Variant": "RTR 200CC", "Min": 168748, "Median": 181759, "Max": 190904},
+    {"Make_Code": "APACHE", "Model_Variant": "APACHE RTR 310", "Min": 287202, "Median": 311024, "Max": 334139},
+    {"Make_Code": "APACHE", "Model_Variant": "APACHE RR 310", "Min": 315333, "Median": 322294, "Max": 345082},
+    {"Make_Code": "SCOOTY", "Model_Variant": "SCOOTY PEP PLUS", "Min": 79125, "Median": 85898, "Max": 97028},
+    {"Make_Code": "APACHE", "Model_Variant": "165 CC", "Min": 179993, "Median": 179993, "Max": 179993}
+]
+
+VALID_VARIANTS = list(set([item["Model_Variant"] for item in VARIANT_CATALOG]))
+
 MASTER_DATA = {
     "Employment_Type": ["SAL", "SEP", "STU", "AGR", "PEN", "NONEARNMEM", "NREGI", "NPP"],
     "Product_Code": ["MC", "SC", "MO", "EB"],
-    "Make_Code": ["JUPITER", "RAIDER", "APACHE", "NTORQ", "RADEON", "RONIN", "MOPEDS", "SPORT", "ZEST", "TVS", "CITY PLUS"]
+    "Make_Code": list(set([item["Make_Code"] for item in VARIANT_CATALOG])),
+    "Model_Variant": VALID_VARIANTS
 }
 
 PREMIUM_WORDS = {
@@ -36,21 +98,18 @@ PREMIUM_WORDS = {
 }
 
 # ==============================================================================
-# 2. MOCK MODEL SETUP (Cached for fast rendering)
+# 3. MOCK UNDERWRITING MODEL
 # ==============================================================================
 @st.cache_resource
 def load_underwriting_model():
-    """Generates a dummy HistGradientBoostingClassifier model for demonstration."""
-    # Define expected columns
     cols = [
         'Loan_Amount', 'Vehicle_Price', 'LTV', 'Loan_to_Salary', 
         'Log_Loan_Amount', 'Premium_Score', 'Age', 'Monthly_Income', 
         'Has_Active_Loans', 'Employment_Type_SAL', 'Employment_Type_SEP', 
         'Product_Code_MC', 'Product_Code_SC', 'Make_Code_APACHE', 'Make_Code_TVS'
     ]
-    # Synthetic training data
     X_dummy = pd.DataFrame(np.random.rand(100, len(cols)), columns=cols)
-    y_dummy = np.random.choice([0, 1], size=100, p=[0.7, 0.3]) # 30% default risk
+    y_dummy = np.random.choice([0, 1], size=100, p=[0.7, 0.3])
     
     model = HistGradientBoostingClassifier(random_state=42)
     model.fit(X_dummy, y_dummy)
@@ -59,7 +118,7 @@ def load_underwriting_model():
 ml_model, MODEL_COLUMNS = load_underwriting_model()
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS & LLM LOGIC
+# 4. EXTRACTION & UNDERWRITING LOGIC
 # ==============================================================================
 def calculate_premium_score(model_desc: str) -> int:
     if not model_desc:
@@ -104,12 +163,14 @@ def predict_risk(model, df_features: pd.DataFrame, model_columns: list) -> float
     aligned_df = df_features.reindex(columns=model_columns, fill_value=0).astype(np.float32)
     return float(model.predict_proba(aligned_df)[0][1])
 
-def extract_phase1_slots(client: Groq, user_input: str) -> dict:
+def extract_phase1_slots(user_input: str) -> dict:
     system_prompt = f"""
-    You are an extraction engine for a two-wheeler loan system.
-    Extract vehicle details and financial details from user input.
-    Make_Code valid choices: {MASTER_DATA['Make_Code']}
-    Product_Code choices: MC (Motorcycle), SC (Scooter), MO (Moped), EB (EV)
+    You are an automotive entity extraction engine. Extract vehicle features and loan amount from user text.
+    
+    MANDATORY ENUM CONSTRAINTS:
+    - Make_Code must be EXACTLY ONE of: {MASTER_DATA['Make_Code']}
+    - Model_Variant must be mapped to the closest canonical variant from: {MASTER_DATA['Model_Variant']}
+    - Product_Code choices: MC (Motorcycle), SC (Scooter), MO (Moped), EB (EV)
     
     Return ONLY JSON:
     {{
@@ -117,11 +178,11 @@ def extract_phase1_slots(client: Groq, user_input: str) -> dict:
       "vehicle_price": FLOAT_OR_NULL,
       "Product_Code": "ENUM_OR_NULL",
       "Make_Code": "ENUM_OR_NULL",
-      "model_description": "STRING_OR_NULL",
-      "model_variant": "STRING_OR_NULL"
+      "Model_Variant": "ENUM_OR_NULL",
+      "model_description": "STRING_OR_NULL"
     }}
     """
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}],
         response_format={"type": "json_object"},
@@ -129,9 +190,9 @@ def extract_phase1_slots(client: Groq, user_input: str) -> dict:
     )
     return json.loads(response.choices[0].message.content)
 
-def extract_phase2_slots(client: Groq, user_input: str) -> dict:
+def extract_phase2_slots(user_input: str) -> dict:
     system_prompt = """
-    Extract customer demographics and map job to Employment_Type.
+    Extract customer demographics and map work/job description to Employment_Type.
     Valid Employment_Type codes: SAL, SEP, STU, AGR, PEN, NONEARNMEM, NREGI, NPP.
     
     Return ONLY JSON:
@@ -143,7 +204,7 @@ def extract_phase2_slots(client: Groq, user_input: str) -> dict:
       "has_active_loans": INT_0_OR_1
     }
     """
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}],
         response_format={"type": "json_object"},
@@ -176,48 +237,49 @@ def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
     }
 
 # ==============================================================================
-# 4. CHATBOT ENGINE ORCHESTRATOR
+# 5. STATE MACHINE & PIPELINE ORCHESTRATOR
 # ==============================================================================
-def process_chat_message(client: Groq, user_input: str):
+def process_chat_message(user_input: str):
     state = st.session_state.chatbot_state
     step = state.get("step", "PHASE_1_COLLECTION")
     
     if step == "PHASE_1_COLLECTION":
-        extracted = extract_phase1_slots(client, user_input)
+        extracted = extract_phase1_slots(user_input)
         for k, v in extracted.items():
             if v is not None:
                 state["p1_data"][k] = v
                 
         p1_data = state["p1_data"]
-        # Slot validation check
+        
+        # Check if missing required slots
         missing = []
         if not p1_data.get('requested_loan_amount'): missing.append('requested_loan_amount')
         if not p1_data.get('vehicle_price'): missing.append('vehicle_price')
         
         if missing:
             if 'vehicle_price' in missing and p1_data.get('requested_loan_amount'):
-                bot_msg = f"Got it, a loan request of ₹{p1_data['requested_loan_amount']:,.0f}! What is the vehicle model name and its expected on-road price?"
+                bot_msg = f"Got it, a loan request of ₹{p1_data['requested_loan_amount']:,.0f}! Which vehicle model/variant are you looking to buy, and what is its expected on-road price?"
             else:
                 bot_msg = "Please specify both the requested loan amount and the on-road vehicle price to proceed."
             return bot_msg
         
-        # Fast Screening Check
+        # Phase 1 Fast Screening Check
         p1_features = build_model_features(p1_data)
         p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS)
         
         if p1_risk <= EARLY_APPROVE_THRESH:
             state["step"] = "COMPLETED"
-            return f"🎉 Excellent news! Your loan request of ₹{p1_data['requested_loan_amount']:,.0f} for the {p1_data.get('model_description', 'vehicle')} is **INSTANTLY PRE-APPROVED**!"
+            return f"🎉 Excellent news! Your loan request of ₹{p1_data['requested_loan_amount']:,.0f} for the **{p1_data.get('Model_Variant', 'vehicle')}** is **INSTANTLY PRE-APPROVED**!"
         elif p1_risk >= EARLY_DECLINE_THRESH:
             offer = calculate_max_eligible_loan(ml_model, p1_data, {})
             state["step"] = "COMPLETED"
             return f"Thank you for applying. We cannot approve ₹{p1_data['requested_loan_amount']:,.0f}, but you are pre-approved for up to **₹{offer['max_eligible_loan']:,.0f}**."
         else:
             state["step"] = "PHASE_2_COLLECTION"
-            return "Vehicle details noted! To complete full underwriting, what is your current occupation, monthly salary, age, and address pincode?"
+            return "Vehicle & loan details verified! To complete full underwriting, what is your current occupation, monthly salary, age, and address pincode?"
 
     elif step == "PHASE_2_COLLECTION":
-        extracted = extract_phase2_slots(client, user_input)
+        extracted = extract_phase2_slots(user_input)
         for k, v in extracted.items():
             if v is not None:
                 state["p2_data"][k] = v
@@ -234,60 +296,51 @@ def process_chat_message(client: Groq, user_input: str):
             req = offer["requested_loan"]
             max_l = offer["max_eligible_loan"]
             if offer["is_partial_possible"]:
-                return f"Thank you for applying. While we cannot approve ₹{req:,.0f}, based on your profile you are pre-approved for up to **₹{max_l:,.0f}**. Update your loan request to ₹{max_l:,.0f} to proceed."
+                return f"Thank you for applying. While we cannot approve ₹{req:,.0f}, based on your profile you are pre-approved for up to **₹{max_l:,.0f}**. You can update your application to ₹{max_l:,.0f} to proceed."
             else:
-                return f"Thank you for applying. We are unable to approve your loan request of ₹{req:,.0f} at this time. You may consider applying with a co-applicant."
+                return f"Thank you for applying. We are unable to approve your loan request of ₹{req:,.0f} at this time."
 
     return "Session complete. Click 'Reset Application' in the sidebar to start over."
 
 # ==============================================================================
-# 5. UI INITIALIZATION & SIDEBAR
+# 6. UI LAYOUT & CHAT INTERFACE
 # ==============================================================================
 st.title("🚗 ABC Credit - Intelligent Loan Assistant")
 
-# Sidebar
-st.sidebar.header("⚙️ Configuration")
-api_key = st.sidebar.text_input("Groq API Key", type="password", help="Enter your Groq API key to run Llama-3 extraction.")
-
+# Sidebar Controls
+st.sidebar.header("⚙️ Controls")
 if st.sidebar.button("🔄 Reset Application"):
     st.session_state.messages = []
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
     st.rerun()
 
-# Initialize session states
+# Sidebar Master Inspector
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔍 Active Application Data")
+st.sidebar.json(st.session_state.chatbot_state)
+
+# Initialize Session Message State
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "👋 Welcome to ABC Credit! Which vehicle are you looking to buy, what is its on-road price, and how much loan do you need?"}
+        {"role": "assistant", "content": "👋 Welcome to ABC Credit! Which vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"}
     ]
 
 if "chatbot_state" not in st.session_state:
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
 
-# Display Session Inspector in Sidebar
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Active Session Payload")
-st.sidebar.json(st.session_state.chatbot_state)
-
-# ==============================================================================
-# 6. MAIN CHAT STREAM
-# ==============================================================================
+# Render Chat Stream
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Type your response here..."):
-    if not api_key:
-        st.error("Please enter your Groq API Key in the left sidebar to proceed.")
-        st.stop()
-        
-    client = Groq(api_key=api_key)
-    
-    # Display user input
+# User Chat Input
+if prompt := st.chat_input("Type your message here..."):
+    # Append & display user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
     
-    # Run Orchestrator Pipeline
-    with st.spinner("Analyzing credit profile..."):
-        bot_response = process_chat_message(client, prompt)
+    # Process through pipeline
+    with st.spinner("Processing request..."):
+        bot_response = process_chat_message(prompt)
         
     st.session_state.messages.append({"role": "assistant", "content": bot_response})
     st.chat_message("assistant").write(bot_response)
