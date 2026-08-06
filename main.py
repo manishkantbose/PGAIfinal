@@ -307,32 +307,33 @@ def process_chat_message(user_input: str):
 # ==============================================================================
 st.title("🚗 ABC Credit - Intelligent Loan Assistant")
 
-# Sidebar Controls
-st.sidebar.header("⚙️ Controls")
-if st.sidebar.button("🔄 Reset Application"):
-    st.session_state.messages = []
+# 1. INITIALIZE SESSION STATE FIRST (Prevents AttributeError)
+if "chatbot_state" not in st.session_state:
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
-    st.rerun()
 
-# Sidebar Master Inspector
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Active Application Data")
-st.sidebar.json(st.session_state.chatbot_state)
-
-# Initialize Session Message State
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": "👋 Welcome to ABC Credit! Which vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"}
     ]
 
-if "chatbot_state" not in st.session_state:
+# 2. SIDEBAR CONTROLS & INSPECTOR
+st.sidebar.header("⚙️ Controls")
+if st.sidebar.button("🔄 Reset Application"):
+    st.session_state.messages = [
+        {"role": "assistant", "content": "👋 Welcome to ABC Credit! Which vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"}
+    ]
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
+    st.rerun()
 
-# Render Chat Stream
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔍 Active Application Data")
+st.sidebar.json(st.session_state.chatbot_state)  # Safe now!
+
+# 3. RENDER CHAT STREAM
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# User Chat Input
+# 4. USER CHAT INPUT
 if prompt := st.chat_input("Type your message here..."):
     # Append & display user message
     st.session_state.messages.append({"role": "user", "content": prompt})
