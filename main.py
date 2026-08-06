@@ -15,10 +15,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS for chat layout & CTA styling
 st.markdown("""
 <style>
-    /* User chat bubble styling (Right Aligned) */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse;
         text-align: right;
@@ -28,7 +26,6 @@ st.markdown("""
         margin-left: 20%;
     }
     
-    /* Assistant chat bubble styling (Left Aligned) */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
         flex-direction: row;
         text-align: left;
@@ -46,16 +43,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Fetch API Key from secrets
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    st.error("⚠️ GROQ_API_KEY not found in Streamlit Secrets! Please add it to `.streamlit/secrets.toml`.")
+    st.error("⚠️ GROQ_API_KEY not found in Streamlit Secrets!")
     st.stop()
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==============================================================================
-# 2. INDEPENDENT MASTER CATALOGS
+# 2. MASTER CATALOGS
 # ==============================================================================
 EARLY_APPROVE_THRESH = 0.15
 EARLY_DECLINE_THRESH = 0.80
@@ -100,13 +96,15 @@ PREMIUM_WORDS = {
 }
 
 FIELD_LABELS = {
-    "requested_loan_amount": "requested loan amount",
-    "vehicle_price": "on-road vehicle price",
-    "Employment_Type": "occupation type (e.g., Salaried, Self-Employed, Student, Agriculture)",
-    "monthly_income": "monthly income",
-    "age": "age",
-    "pincode": "area pincode",
-    "has_active_loans": "active loans status (whether you currently have existing active loans)"
+    "requested_loan_amount": "Requested Loan Amount",
+    "vehicle_price": "On-Road Vehicle Price",
+    "Employment_Type": "Occupation / Employment Type (e.g. Salaried, Business, Student)",
+    "monthly_income": "Monthly Income",
+    "age": "Age",
+    "pincode": "Pincode",
+    "has_active_loans": "Active Loans / Existing EMIs status",
+    "Make_Code": "Vehicle Brand/Make",
+    "Model_Variant": "Vehicle Model/Variant"
 }
 
 # ==============================================================================
@@ -175,18 +173,28 @@ def predict_risk(model, df_features: pd.DataFrame, model_columns: list) -> float
     aligned_df = df_features.reindex(columns=model_columns, fill_value=0).astype(np.float32)
     return float(model.predict_proba(aligned_df)[0][1])
 
-def extract_all_slots(user_input: str) -> dict:
-    """Unified slot extractor capturing both Phase 1 and Phase 2 entities simultaneously."""
+def extract_all_slots(user_input: str, current_state: dict) -> dict:
+    """Robust extraction logic handling Indian currency formats, typos, and historical state."""
     system_prompt = f"""
-    You are an AI automotive loan entity extraction engine. Extract all relevant details from user text.
+    You are an AI loan entity extraction engine.
+    Extract numbers accurately, especially from Indian currency inputs.
+    
+    SPECIAL NUMERIC EXTRACTION RULES:
+    - Parse numeric values intelligently even if formatted with typos.
+    - "250000 lakh" or "2.5 lakh" or "2,50,000" -> Parse value as 250000.
+    - "2.5L" or "2.5 lakhs" -> Parse value as 250000.
+    - "250k" -> Parse value as 250000.
+    - If user enters a raw integer like "250000", output 250000.0.
     
     MANDATORY ENUM MAPPINGS:
     - Make_Code choice must be mapped to one of: {MAKE_MASTER}
     - Model_Variant choice must be mapped to closest variant from: {VARIANT_MASTER}
     - Product_Code choice must be one of: {PRODUCT_CODE_MASTER}
     - Employment_Type choice must be one of: {EMPLOYMENT_TYPE_MASTER}
-      (Map 'salaried' -> 'SAL', 'self employed'/'business' -> 'SEP', 'student' -> 'STU', 'farmer'/'agri' -> 'AGR', 'pensioner' -> 'PEN')
-    - has_active_loans: Set to 1 if user indicates active loans/EMIs, 0 if user explicitly states no active loans/EMIs, null if unmentioned.
+      ('salaried' -> 'SAL', 'self employed'/'business' -> 'SEP', 'student' -> 'STU', 'farmer'/'agri' -> 'AGR', 'pensioner' -> 'PEN')
+    - has_active_loans: 1 if user indicates active loans/EMIs, 0 if user explicitly states no active loans/EMIs, null if unmentioned.
+
+    Current collected data: {json.dumps(current_state)}
 
     Return ONLY JSON:
     {{
@@ -238,18 +246,17 @@ def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
         "is_partial_possible": max_approved >= (0.30 * vehicle_price)
     }
 
-def build_pinpoint_question(missing_fields: list) -> str:
-    """Generates precise, dynamic follow-up questions for missing fields only."""
-    readable_missing = [FIELD_LABELS.get(f, f) for f in missing_fields]
+def format_prompt_question(missing_mandatory: list, missing_optional: list) -> str:
+    """Generates prompt asking for mandatory items, with optional items encouraged in the same message."""
+    mandatory_str = ", ".join([f"**{FIELD_LABELS[f]}**" for f in missing_mandatory])
     
-    if len(readable_missing) == 1:
-        items_str = f"your **{readable_missing[0]}**"
-    elif len(readable_missing) == 2:
-        items_str = f"your **{readable_missing[0]}** and **{readable_missing[1]}**"
-    else:
-        items_str = ", ".join([f"**{item}**" for item in readable_missing[:-1]]) + f", and **{readable_missing[-1]}**"
+    msg = f"To proceed with your application, please provide your {mandatory_str}."
+    
+    if missing_optional:
+        optional_str = ", ".join([f"**{FIELD_LABELS[f]}**" for f in missing_optional])
+        msg += f"\n\n*(Optionally, you can also mention your {optional_str} to help us give you a better offer)*"
         
-    return f"To proceed with your application, please provide {items_str}."
+    return msg
 
 # ==============================================================================
 # 5. STATE MACHINE & PIPELINE ORCHESTRATOR
@@ -257,10 +264,9 @@ def build_pinpoint_question(missing_fields: list) -> str:
 def process_chat_message(user_input: str):
     state = st.session_state.chatbot_state
     
-    # 1. Unified extraction pass across all fields
-    extracted = extract_all_slots(user_input)
+    # Context-aware slot extraction
+    extracted = extract_all_slots(user_input, {"p1": state["p1_data"], "p2": state["p2_data"]})
     
-    # Route extracted values to appropriate phase store
     p1_keys = ['requested_loan_amount', 'vehicle_price', 'Product_Code', 'Make_Code', 'Model_Variant', 'model_description']
     p2_keys = ['Employment_Type', 'monthly_income', 'age', 'pincode', 'has_active_loans']
     
@@ -274,15 +280,21 @@ def process_chat_message(user_input: str):
     p1_data = state["p1_data"]
     p2_data = state["p2_data"]
     
-    # 2. Phase 1 Evaluation Logic
+    # --------------------------------------------------------------------------
+    # PHASE 1 EVALUATION
+    # --------------------------------------------------------------------------
     if state["step"] == "PHASE_1_COLLECTION":
         p1_mandatory = ['requested_loan_amount', 'vehicle_price']
-        missing_p1 = [field for field in p1_mandatory if p1_data.get(field) is None]
+        p1_optional = ['Make_Code', 'Model_Variant']
         
-        if missing_p1:
-            return build_pinpoint_question(missing_p1)
+        missing_p1_mand = [f for f in p1_mandatory if p1_data.get(f) is None]
+        missing_p1_opt = [f for f in p1_optional if p1_data.get(f) is None]
         
-        # Mandatory Phase 1 fields collected -> Assess Phase 1 Risk
+        # IF mandatory is missing -> Ask for missing mandatory + encourage optional
+        if missing_p1_mand:
+            return format_prompt_question(missing_p1_mand, missing_p1_opt)
+        
+        # IF mandatory IS present -> Move forward directly WITHOUT asking follow-ups!
         p1_features = build_model_features(p1_data, p2_data)
         p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS)
         
@@ -296,15 +308,19 @@ def process_chat_message(user_input: str):
         else:
             state["step"] = "PHASE_2_COLLECTION"
 
-    # 3. Phase 2 Evaluation Logic
+    # --------------------------------------------------------------------------
+    # PHASE 2 EVALUATION
+    # --------------------------------------------------------------------------
     if state["step"] == "PHASE_2_COLLECTION":
         p2_mandatory = ['Employment_Type', 'monthly_income', 'age', 'pincode', 'has_active_loans']
-        missing_p2 = [field for field in p2_mandatory if p2_data.get(field) is None]
         
-        if missing_p2:
-            return build_pinpoint_question(missing_p2)
+        missing_p2_mand = [f for f in p2_mandatory if p2_data.get(f) is None]
         
-        # All Phase 2 fields present -> Run full underwriting
+        # IF Phase 2 mandatory fields are missing -> Prompt user
+        if missing_p2_mand:
+            return format_prompt_question(missing_p2_mand, missing_optional=[])
+        
+        # IF Phase 2 mandatory fields ARE present -> Run full underwriting
         full_features = build_model_features(p1_data, p2_data)
         final_risk = predict_risk(ml_model, full_features, MODEL_COLUMNS)
         state["step"] = "COMPLETED"
@@ -333,28 +349,23 @@ def reset_application():
 # ==============================================================================
 st.title("🚗 ABC Credit - Intelligent Loan Assistant")
 
-# Initialize Session State
 if "chatbot_state" not in st.session_state:
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
 
 if "messages" not in st.session_state:
     reset_application()
 
-# Clean Sidebar Controls
 st.sidebar.header("⚙️ Application Controls")
 if st.sidebar.button("🔄 Reset / Start Over"):
     reset_application()
     st.rerun()
 
-# Developer Debugger (Hidden by default)
 with st.sidebar.expander("🛠️ Developer Debugger", expanded=False):
     st.json(st.session_state.chatbot_state)
 
-# Render Chat History
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# End-of-Flow CTA vs Chat Input
 is_completed = st.session_state.chatbot_state.get("step") == "COMPLETED"
 
 if is_completed:
