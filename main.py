@@ -192,7 +192,6 @@ def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
         else:
             high = mid
             
-    # Counter-offer condition: Eligible loan must be at least 30% of vehicle price & > ₹10,000
     is_partial_possible = (max_approved >= (0.30 * vehicle_price)) and (max_approved >= 10000)
     
     return {
@@ -229,20 +228,24 @@ def generate_decline_reasons(p1_data: dict, p2_data: dict) -> list:
     return reasons
 
 # ==============================================================================
-# 5. EXTRACTION & DIALOGUE HELPERS
+# 5. CONTEXT-AWARE EXTRACTION & DIALOGUE HELPERS
 # ==============================================================================
-def extract_all_slots(user_input: str, current_state: dict) -> dict:
-    """Robust slot extraction handling Indian formats and historical chat state."""
+def extract_all_slots(user_input: str, current_state: dict, last_assistant_message: str = "") -> dict:
+    """Robust slot extraction incorporating conversational context and Indian currency formats."""
     system_prompt = f"""
     You are an AI loan entity extraction engine.
-    Extract numbers accurately, especially from Indian currency inputs.
+    Extract slots accurately from the user's message, taking into account what the assistant just asked them.
     
-    SPECIAL NUMERIC EXTRACTION RULES:
-    - Parse numeric values intelligently even if formatted with typos.
-    - "250000 lakh" or "2.5 lakh" or "2,50,000" -> Parse value as 250000.
-    - "2.5L" or "2.5 lakhs" -> Parse value as 250000.
-    - "250k" -> Parse value as 250000.
-    - If user enters a raw integer like "250000", output 250000.0.
+    CONVERSATIONAL CONTEXT RULE:
+    - Assistant's last prompt to user: "{last_assistant_message}"
+    - Current collected state: {json.dumps(current_state)}
+    - IF the assistant explicitly asked for a specific field (e.g., "On-Road Vehicle Price") and the user responds with a standalone number or currency string (e.g., "250000 rs", "2.5 lakh", "250000"), YOU MUST MAP THIS VALUE directly to that requested field ("vehicle_price").
+
+    NUMERIC & CURRENCY EXTRACTION RULES:
+    - Parse numeric values accurately from Indian formats:
+      - "250000 rs" / "250000" -> 250000.0
+      - "2.5 lakh" / "2.5L" / "2.5 lakhs" -> 250000.0
+      - "250k" -> 250000.0
     
     MANDATORY ENUM MAPPINGS:
     - Make_Code choice must be mapped to one of: {MAKE_MASTER}
@@ -251,8 +254,6 @@ def extract_all_slots(user_input: str, current_state: dict) -> dict:
     - Employment_Type choice must be one of: {EMPLOYMENT_TYPE_MASTER}
       ('salaried' -> 'SAL', 'self employed'/'business' -> 'SEP', 'student' -> 'STU', 'farmer'/'agri' -> 'AGR', 'pensioner' -> 'PEN')
     - has_active_loans: 1 if user indicates active loans/EMIs, 0 if user explicitly states no active loans/EMIs, null if unmentioned.
-
-    Current collected data: {json.dumps(current_state)}
 
     Return ONLY JSON:
     {{
@@ -298,8 +299,19 @@ def format_prompt_question(missing_mandatory: list, missing_optional: list) -> s
 def process_chat_message(user_input: str):
     state = st.session_state.chatbot_state
     
-    # Extract slots passing full accumulated state context
-    extracted = extract_all_slots(user_input, {"p1": state["p1_data"], "p2": state["p2_data"]})
+    # Retrieve last assistant message for extraction context
+    last_assistant_msg = ""
+    for msg in reversed(st.session_state.messages):
+        if msg["role"] == "assistant":
+            last_assistant_msg = msg["content"]
+            break
+
+    # Extract slots passing context and accumulated state
+    extracted = extract_all_slots(
+        user_input=user_input, 
+        current_state={"p1": state["p1_data"], "p2": state["p2_data"]},
+        last_assistant_message=last_assistant_msg
+    )
     
     p1_keys = ['requested_loan_amount', 'vehicle_price', 'Product_Code', 'Make_Code', 'Model_Variant', 'model_description']
     p2_keys = ['Employment_Type', 'monthly_income', 'age', 'pincode', 'has_active_loans']
@@ -324,11 +336,9 @@ def process_chat_message(user_input: str):
         missing_p1_mand = [f for f in p1_mandatory if p1_data.get(f) is None]
         missing_p1_opt = [f for f in p1_optional if p1_data.get(f) is None]
         
-        # Ask if mandatory missing
         if missing_p1_mand:
             return format_prompt_question(missing_p1_mand, missing_p1_opt)
         
-        # Mandatory fields present -> Proceed immediately without asking optional follow-ups
         p1_features = build_model_features(p1_data, p2_data)
         p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS)
         
@@ -354,11 +364,9 @@ def process_chat_message(user_input: str):
         p2_mandatory = ['Employment_Type', 'monthly_income', 'age', 'pincode', 'has_active_loans']
         missing_p2_mand = [f for f in p2_mandatory if p2_data.get(f) is None]
         
-        # Ask if mandatory missing
         if missing_p2_mand:
             return format_prompt_question(missing_p2_mand, missing_optional=[])
         
-        # Mandatory fields present -> Execute full underwriting decision
         full_features = build_model_features(p1_data, p2_data)
         final_risk = predict_risk(ml_model, full_features, MODEL_COLUMNS)
         state["step"] = "COMPLETED"
@@ -370,14 +378,12 @@ def process_chat_message(user_input: str):
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             max_l = offer["max_eligible_loan"]
             
-            # Counter-offer provided if partial loan is viable
             if offer["is_partial_possible"]:
                 return (
                     f"Thank you for applying. While we cannot approve **₹{req:,.0f}**, "
                     f"based on your profile you are pre-approved for an eligible loan amount of up to **₹{max_l:,.0f}**."
                 )
             else:
-                # Full decline with adverse action reasons
                 reasons = generate_decline_reasons(p1_data, p2_data)
                 reasons_formatted = "\n".join([f"- {r}" for r in reasons])
                 return (
