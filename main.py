@@ -75,8 +75,8 @@ def record_audit_log(event_type: str, payload: dict):
     except Exception:
         pass
 
-EARLY_APPROVE_THRESH = 0.30
-EARLY_DECLINE_THRESH = 0.70
+EARLY_APPROVE_THRESH = 0.15
+EARLY_DECLINE_THRESH = 0.80
 FINAL_DECISION_THRESH = 0.44
 
 MAX_HARD_STOP_LTV = 100.0    # Hard rejection if LTV > 100%
