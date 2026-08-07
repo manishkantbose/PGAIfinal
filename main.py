@@ -9,7 +9,7 @@ from groq import Groq
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 # ==============================================================================
-# 1. PAGE SETUP & CSS CHAT ALIGNMENT
+# 1. PAGE SETUP & CSS CHAT ALIGNMENT (DARK/LIGHT ADAPTIVE)
 # ==============================================================================
 st.set_page_config(
     page_title="ABC Credit - Vehicle Loan Assistant",
@@ -19,24 +19,34 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    /* Adapt User Chat Message Bubble to Light & Dark Modes */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse;
         text-align: right;
-        background-color: #e8f5e9;
+        background-color: rgba(76, 175, 80, 0.15); /* Translucent green tint */
+        border: 1px solid rgba(76, 175, 80, 0.35);
         border-radius: 12px;
-        padding: 8px 12px;
+        padding: 10px 14px;
         margin-left: 20%;
     }
-    
+
+    /* Adapt Assistant Chat Message Bubble to Light & Dark Modes */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
         flex-direction: row;
         text-align: left;
-        background-color: #f1f3f4;
+        background-color: var(--secondary-background-color);
+        border: 1px solid rgba(128, 128, 128, 0.2);
         border-radius: 12px;
-        padding: 8px 12px;
+        padding: 10px 14px;
         margin-right: 20%;
     }
-    
+
+    /* Force text and inner components to respect current theme text color */
+    [data-testid="stChatMessage"] * {
+        color: var(--text-color) !important;
+    }
+
+    /* Sidebar buttons styling */
     .stButton>button {
         width: 100%;
         border-radius: 8px;
@@ -308,10 +318,6 @@ def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_
                 f"to adjust the loan to ₹{max_target_loan:,.0f} (80% LTV)."
             )
 
-    #if income > 0 and (req_loan / income) > 3.0:
-     #   reasons.append(f"Requested loan amount is high relative to net monthly income ({req_loan / income:.1f}x monthly income).")
-     #   improvements.append("**Add Co-Applicant:** Include an earning co-applicant to increase total recognized household income.")
-
     if check_over_invoicing(p1_data):
         reasons.append("Vehicle quotation exceeds maximum market benchmark price for this variant.")
         improvements.append("**Review Quotation:** Verify dealer invoice price against standard market benchmark.")
@@ -565,7 +571,6 @@ def process_chat_message(user_input: str):
     return "Session complete."
 
 def reset_application():
-    # Generate a unique application ID for this session
     st.session_state.app_id = str(uuid.uuid4())[:8].upper()
     initial_msg = f"👋 Welcome to ABC Credit! (App ID: `{st.session_state.app_id}`) \n\nWhich vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"
     st.session_state.messages = [
@@ -610,7 +615,6 @@ with st.sidebar.expander("📜 Audit Logs Viewer", expanded=False):
             if logs:
                 df_logs = pd.DataFrame(logs)
                 
-                # Filter by Application ID option
                 unique_apps = ["ALL"] + df_logs["app_id"].dropna().unique().tolist()
                 selected_app_filter = st.selectbox("Filter by App ID", unique_apps)
                 
