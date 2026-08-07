@@ -593,24 +593,7 @@ for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
 is_completed = st.session_state.chatbot_state.get("step") == "COMPLETED"
-with st.sidebar.expander("📜 Audit Logs Viewer", expanded=False):
-    admin_pass = st.text_input("Enter Admin Password", type="password")
-    
-    # Replace "your_secure_password" with your desired password or use st.secrets
-    if admin_pass == "your_secure_password":
-        if st.button("Refresh Logs"):
-            st.rerun()
-        try:
-            with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
-                logs = [json.loads(line) for line in f.readlines()]
-                if logs:
-                    st.dataframe(pd.DataFrame(logs))
-                else:
-                    st.info("Log file is empty.")
-        except FileNotFoundError:
-            st.info("No audit logs recorded yet.")
-    elif admin_pass:
-        st.error("Incorrect password.")
+
 if is_completed:
     st.markdown("---")
     st.success("✅ Application process finished.")
