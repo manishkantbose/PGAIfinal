@@ -51,11 +51,19 @@ if not GROQ_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==============================================================================
-# 2. MASTER CATALOGS & THRESHOLDS
+# 2. MASTER CATALOGS & HARMONIZED THRESHOLDS
 # ==============================================================================
-EARLY_APPROVE_THRESH = 0.15
-EARLY_DECLINE_THRESH = 0.80
+# Phase 1 Decision Thresholds (Harmonized with Code 2)
+EARLY_APPROVE_THRESH = 0.30
+EARLY_DECLINE_THRESH = 0.70
 FINAL_DECISION_THRESH = 0.44
+
+# Strict Hard Underwriting Policy Limits
+MAX_HARD_STOP_LTV = 100.0    # Hard rejection if LTV > 100%
+TARGET_POLICY_LTV = 80.0     # Safe underwriting baseline target
+MIN_MONTHLY_INCOME = 1000.0  # Minimum income floor
+MIN_AGE = 18
+MAX_AGE = 60
 
 PRICE_BENCHMARK_MASTER = pd.DataFrame([
     {"Make_Code": "RAIDER", "Model_Variant": "RAIDER", "Min_Price": 114698.26, "Median_Price": 118997.16, "Max_Price": 130714.53, "Approved_Samples": 17654},
@@ -108,7 +116,7 @@ FIELD_LABELS = {
 }
 
 # ==============================================================================
-# 3. UNDERWRITING MODEL LOGIC
+# 3. UNDERWRITING MODEL & POLICY ENGINE LOGIC
 # ==============================================================================
 @st.cache_resource
 def load_underwriting_model():
@@ -126,6 +134,24 @@ def load_underwriting_model():
     return model, cols
 
 ml_model, MODEL_COLUMNS = load_underwriting_model()
+
+def check_over_invoicing(p1_data: dict) -> bool:
+    """Verifies if vehicle price exceeds the benchmark maximum threshold."""
+    price = float(p1_data.get('vehicle_price', 0))
+    make = p1_data.get('Make_Code')
+    variant = p1_data.get('Model_Variant')
+    
+    matched = PRICE_BENCHMARK_MASTER[
+        (PRICE_BENCHMARK_MASTER['Make_Code'] == make) & 
+        (PRICE_BENCHMARK_MASTER['Model_Variant'] == variant)
+    ]
+    if matched.empty and make:
+        matched = PRICE_BENCHMARK_MASTER[PRICE_BENCHMARK_MASTER['Make_Code'] == make]
+        
+    if not matched.empty:
+        max_allowed = float(matched['Max_Price'].max())
+        return price > max_allowed
+    return False
 
 def calculate_premium_score(model_desc: str) -> int:
     if not model_desc:
@@ -147,7 +173,9 @@ def build_model_features(p1_data: dict, p2_data: dict = None) -> pd.DataFrame:
     salary = float(p2_data.get('monthly_income', 50000))
     
     ltv = (req_loan / price * 100.0) if price > 0 else 100.0
-    loan_to_salary = req_loan / (salary * 12 + 1.0)
+    
+    # Correction: Monthly Salary Ratio (Harmonized with Code 2)
+    loan_to_salary = req_loan / (salary + 1.0)
     prem_score = calculate_premium_score(p1_data.get('model_description', ''))
     
     payload = {
@@ -166,25 +194,73 @@ def build_model_features(p1_data: dict, p2_data: dict = None) -> pd.DataFrame:
     }
     return pd.get_dummies(pd.DataFrame([payload]))
 
-def predict_risk(model, df_features: pd.DataFrame, model_columns: list) -> float:
+def predict_risk(model, df_features: pd.DataFrame, model_columns: list, is_over_invoiced: bool = False) -> float:
     aligned_df = df_features.reindex(columns=model_columns, fill_value=0).astype(np.float32)
-    return float(model.predict_proba(aligned_df)[0][1])
+    base_risk = float(model.predict_proba(aligned_df)[0][1])
+    
+    # Penalty adjustment for over-invoiced quotations (Harmonized with Code 2)
+    penalty = 0.15 if is_over_invoiced else 0.0
+    return min(1.0, base_risk + penalty)
+
+def evaluate_hard_policy_stops(p1_data: dict, p2_data: dict = None) -> tuple:
+    """Evaluates strict non-negotiable underwriting rules."""
+    reasons = []
+    req_loan = float(p1_data.get('requested_loan_amount', 0))
+    price = float(p1_data.get('vehicle_price', 1))
+    ltv = (req_loan / price * 100.0) if price > 0 else 0.0
+
+    # Rule 1: High LTV Cap Stop
+    if ltv > MAX_HARD_STOP_LTV:
+        reasons.append(
+            f"Loan-to-Value (LTV) ratio is **{ltv:.1f}%**, which exceeds our maximum permissible policy limit of **{MAX_HARD_STOP_LTV:.0f}%** "
+            f"(Loan requested: ₹{req_loan:,.0f} vs Vehicle Price: ₹{price:,.0f})."
+        )
+
+    if p2_data:
+        income = float(p2_data.get('monthly_income', 0))
+        age = p2_data.get('age')
+        emp_type = p2_data.get('Employment_Type', '')
+
+        # Rule 2: Minimum Income Floor
+        if income < MIN_MONTHLY_INCOME:
+            reasons.append(
+                f"Reported monthly income of **₹{income:,.0f}** is below our minimum policy floor of **₹{MIN_MONTHLY_INCOME:,.0f}**."
+            )
+
+        # Rule 3: Age Limits
+        if age is not None and (int(age) < MIN_AGE or int(age) > MAX_AGE):
+            reasons.append(
+                f"Applicant age (**{age} years**) falls outside our eligible policy age bracket ({MIN_AGE} to {MAX_AGE} years)."
+            )
+
+        # Rule 4: Non-Earning Category
+        if emp_type in ['STU', 'NONEARNMEM']:
+            reasons.append(
+                "Employment category falls under non-earning status (Student / Non-Working Member), requiring a primary earning co-applicant."
+            )
+
+    return len(reasons) > 0, reasons
 
 # ==============================================================================
 # 4. COUNTER-OFFER & REASON GENERATOR LOGIC
 # ==============================================================================
 def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
-    """Calculates maximum approved loan amount using binary search."""
+    """Calculates maximum approved loan amount using binary search capped at target LTV."""
     req_loan = float(p1_data.get('requested_loan_amount', 0))
     vehicle_price = float(p1_data.get('vehicle_price', 1))
-    low, high, max_approved = 0.0, req_loan, 0.0
+    is_over_invoiced = check_over_invoicing(p1_data)
+    
+    max_policy_loan = vehicle_price * (TARGET_POLICY_LTV / 100.0)
+    search_ceiling = min(req_loan, max_policy_loan)
+    
+    low, high, max_approved = 0.0, search_ceiling, 0.0
     
     for _ in range(12):
         mid = (low + high) / 2.0
         test_p1 = p1_data.copy()
         test_p1['requested_loan_amount'] = mid
         df_feat = build_model_features(test_p1, p2_data)
-        risk = predict_risk(model, df_feat, MODEL_COLUMNS)
+        risk = predict_risk(model, df_feat, MODEL_COLUMNS, is_over_invoiced=is_over_invoiced)
         
         if risk <= FINAL_DECISION_THRESH:
             max_approved = mid
@@ -197,41 +273,61 @@ def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
     return {
         "requested_loan": req_loan,
         "max_eligible_loan": max_approved,
-        "is_partial_possible": is_partial_possible
+        "is_partial_possible": is_partial_possible,
+        "max_policy_cap": max_policy_loan
     }
 
-def generate_decline_reasons(p1_data: dict, p2_data: dict) -> list:
-    """Identifies primary financial and demographic risk factors leading to decline."""
-    reasons = []
-    
+def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_reasons: list = None) -> tuple:
+    """Generates dynamic decision reasons and actionable improvement advice."""
+    reasons = hard_stop_reasons.copy() if hard_stop_reasons else []
+    improvements = []
+
     req_loan = float(p1_data.get('requested_loan_amount', 0))
     price = float(p1_data.get('vehicle_price', 1))
-    income = float(p2_data.get('monthly_income', 0))
-    emp_type = p2_data.get('Employment_Type', '')
-    
-    ltv = (req_loan / price) * 100 if price > 0 else 0
+    income = float(p2_data.get('monthly_income', 0)) if p2_data else 0.0
+    active_loans = int(p2_data.get('has_active_loans', 0)) if p2_data else 0
 
-    if income == 0:
-        reasons.append("Insufficient or unverified monthly income (₹0 reported)")
-    elif (req_loan / (income * 12 + 1)) > 3.0:
-        reasons.append("Requested loan amount is significantly high relative to annual income")
-        
-    if emp_type in ['STU', 'NONEARNMEM']:
-        reasons.append("Employment profile falls outside standard income-earning categories")
-        
-    if ltv > 80:
-        reasons.append(f"High Loan-to-Value (LTV) ratio of {ltv:.1f}% exceeds maximum standard limit")
+    ltv = (req_loan / price) * 100.0 if price > 0 else 0.0
+    max_target_loan = price * (TARGET_POLICY_LTV / 100.0)
+    extra_downpayment_needed = max(0.0, req_loan - max_target_loan)
+
+    # LTV Evaluation
+    if ltv > TARGET_POLICY_LTV:
+        if ltv <= MAX_HARD_STOP_LTV:
+            reasons.append(f"LTV ratio of **{ltv:.1f}%** exceeds target policy limit of **{TARGET_POLICY_LTV:.0f}%**.")
+        if extra_downpayment_needed > 0:
+            improvements.append(
+                f"**Increase Down Payment:** Pay an extra **₹{extra_downpayment_needed:,.0f}** down payment "
+                f"to adjust the loan to ₹{max_target_loan:,.0f} (80% LTV)."
+            )
+
+    # Debt-to-Income Check
+    if income > 0 and (req_loan / income) > 3.0:
+        reasons.append(f"Requested loan amount is high relative to net monthly income ({req_loan / income:.1f}x monthly income).")
+        improvements.append("**Add Co-Applicant:** Include an earning co-applicant to increase total recognized household income.")
+
+    # Over-Invoicing Evaluation
+    if check_over_invoicing(p1_data):
+        reasons.append("Vehicle quotation exceeds maximum market benchmark price for this variant.")
+        improvements.append("**Review Quotation:** Verify dealer invoice price against standard market benchmark.")
+
+    # Prior Active Debt Check
+    if active_loans == 1:
+        reasons.append("Active prior loan obligations increase overall credit risk.")
+        improvements.append("**Clear Existing Debt:** Pay off active EMIs or short-term loans to reduce debt burden.")
 
     if not reasons:
-        reasons.append("Overall credit risk score exceeded permissible underwriting policy limits")
-        
-    return reasons
+        reasons.append("Overall risk score exceeded underwriting thresholds.")
+
+    if not improvements:
+        improvements.append(f"**Lower Loan Request:** Lower loan request to ₹{req_loan * 0.85:,.0f} to improve eligibility.")
+
+    return reasons, improvements
 
 # ==============================================================================
 # 5. CONTEXT-AWARE EXTRACTION & DIALOGUE HELPERS
 # ==============================================================================
 def extract_all_slots(user_input: str, current_state: dict, last_assistant_message: str = "") -> dict:
-    """Robust slot extraction incorporating conversational context and Indian currency formats."""
     system_prompt = f"""
     You are an AI loan entity extraction engine.
     Extract slots accurately from the user's message, taking into account what the assistant just asked them.
@@ -282,15 +378,11 @@ def extract_all_slots(user_input: str, current_state: dict, last_assistant_messa
         return {}
 
 def format_prompt_question(missing_mandatory: list, missing_optional: list) -> str:
-    """Asks for missing mandatory items while encouraging optional ones in the same phrase."""
     mandatory_str = ", ".join([f"**{FIELD_LABELS[f]}**" for f in missing_mandatory])
-    
     msg = f"To proceed with your application, please provide your {mandatory_str}."
-    
     if missing_optional:
         optional_str = ", ".join([f"**{FIELD_LABELS[f]}**" for f in missing_optional])
         msg += f"\n\n*(Optionally, you can also mention your {optional_str} to help us give you a better offer)*"
-        
     return msg
 
 # ==============================================================================
@@ -299,14 +391,12 @@ def format_prompt_question(missing_mandatory: list, missing_optional: list) -> s
 def process_chat_message(user_input: str):
     state = st.session_state.chatbot_state
     
-    # Retrieve last assistant message for extraction context
     last_assistant_msg = ""
     for msg in reversed(st.session_state.messages):
         if msg["role"] == "assistant":
             last_assistant_msg = msg["content"]
             break
 
-    # Extract slots passing context and accumulated state
     extracted = extract_all_slots(
         user_input=user_input, 
         current_state={"p1": state["p1_data"], "p2": state["p2_data"]},
@@ -339,8 +429,33 @@ def process_chat_message(user_input: str):
         if missing_p1_mand:
             return format_prompt_question(missing_p1_mand, missing_p1_opt)
         
+        # Hard Stop Policy Check (e.g., LTV > 100%)
+        is_hard_stop, hard_reasons = evaluate_hard_policy_stops(p1_data)
+        if is_hard_stop:
+            state["step"] = "COMPLETED"
+            offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
+            reasons, improvements = generate_explained_decline_analysis(p1_data, p2_data, hard_reasons)
+            
+            reasons_formatted = "\n".join([f"- {r}" for r in reasons])
+            improvements_formatted = "\n".join([f"- {i}" for i in improvements])
+
+            if offer["is_partial_possible"]:
+                return (
+                    f"Thank you for applying. We cannot approve **₹{p1_data['requested_loan_amount']:,.0f}** due to policy bounds.\n\n"
+                    f"**Primary Decision Reason(s):**\n{reasons_formatted}\n\n"
+                    f"🎉 However, you are **PRE-APPROVED** for an eligible loan of up to **₹{offer['max_eligible_loan']:,.0f}** (capped at 80% LTV).\n\n"
+                    f"💡 **Recommended Action:**\n{improvements_formatted}"
+                )
+            else:
+                return (
+                    f"Thank you for applying. We are unable to approve your loan request of **₹{p1_data['requested_loan_amount']:,.0f}**.\n\n"
+                    f"**Primary Decision Reason(s):**\n{reasons_formatted}\n\n"
+                    f"💡 **How to Qualify:**\n{improvements_formatted}"
+                )
+
+        is_over_invoiced = check_over_invoicing(p1_data)
         p1_features = build_model_features(p1_data, p2_data)
-        p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS)
+        p1_risk = predict_risk(ml_model, p1_features, MODEL_COLUMNS, is_over_invoiced=is_over_invoiced)
         
         if p1_risk <= EARLY_APPROVE_THRESH:
             state["step"] = "COMPLETED"
@@ -348,12 +463,22 @@ def process_chat_message(user_input: str):
         elif p1_risk >= EARLY_DECLINE_THRESH:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             state["step"] = "COMPLETED"
+            reasons, improvements = generate_explained_decline_analysis(p1_data, p2_data)
+            reasons_formatted = "\n".join([f"- {r}" for r in reasons])
+            improvements_formatted = "\n".join([f"- {i}" for i in improvements])
+
             if offer["is_partial_possible"]:
-                return f"Thank you for applying. We cannot approve ₹{p1_data['requested_loan_amount']:,.0f}, but you are pre-approved for up to **₹{offer['max_eligible_loan']:,.0f}**."
+                return (
+                    f"Thank you for applying. We cannot approve ₹{p1_data['requested_loan_amount']:,.0f}, but you are pre-approved for up to **₹{offer['max_eligible_loan']:,.0f}**.\n\n"
+                    f"**Key Reason(s):**\n{reasons_formatted}\n\n"
+                    f"💡 **Action Steps:**\n{improvements_formatted}"
+                )
             else:
-                reasons = generate_decline_reasons(p1_data, p2_data)
-                reasons_formatted = "\n".join([f"- {r}" for r in reasons])
-                return f"Thank you for applying. We are unable to approve your loan request of **₹{p1_data['requested_loan_amount']:,.0f}** at this time.\n\n**Primary Key Reason(s):**\n{reasons_formatted}"
+                return (
+                    f"Thank you for applying. We are unable to approve your loan request of **₹{p1_data['requested_loan_amount']:,.0f}** at this time.\n\n"
+                    f"**Primary Reason(s):**\n{reasons_formatted}\n\n"
+                    f"💡 **How to Improve:**\n{improvements_formatted}"
+                )
         else:
             state["step"] = "PHASE_2_COLLECTION"
 
@@ -367,29 +492,37 @@ def process_chat_message(user_input: str):
         if missing_p2_mand:
             return format_prompt_question(missing_p2_mand, missing_optional=[])
         
+        # Hard Stop Policy Check in Phase 2
+        is_hard_stop, hard_reasons = evaluate_hard_policy_stops(p1_data, p2_data)
+        is_over_invoiced = check_over_invoicing(p1_data)
         full_features = build_model_features(p1_data, p2_data)
-        final_risk = predict_risk(ml_model, full_features, MODEL_COLUMNS)
+        final_risk = predict_risk(ml_model, full_features, MODEL_COLUMNS, is_over_invoiced=is_over_invoiced)
         state["step"] = "COMPLETED"
         
         req = p1_data["requested_loan_amount"]
-        if final_risk < FINAL_DECISION_THRESH:
+
+        if final_risk < FINAL_DECISION_THRESH and not is_hard_stop:
             return f"🎉 Congratulations! Your loan request of **₹{req:,.0f}** has been **FULLY APPROVED**."
         else:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             max_l = offer["max_eligible_loan"]
+            reasons, improvements = generate_explained_decline_analysis(p1_data, p2_data, hard_reasons if is_hard_stop else None)
+            
+            reasons_formatted = "\n".join([f"- {r}" for r in reasons])
+            improvements_formatted = "\n".join([f"- {i}" for i in improvements])
             
             if offer["is_partial_possible"]:
                 return (
                     f"Thank you for applying. While we cannot approve **₹{req:,.0f}**, "
-                    f"based on your profile you are pre-approved for an eligible loan amount of up to **₹{max_l:,.0f}**."
+                    f"based on your profile you are pre-approved for an eligible loan amount of up to **₹{max_l:,.0f}**.\n\n"
+                    f"**Primary Key Reason(s):**\n{reasons_formatted}\n\n"
+                    f"💡 **How to Qualify for Full Amount:**\n{improvements_formatted}"
                 )
             else:
-                reasons = generate_decline_reasons(p1_data, p2_data)
-                reasons_formatted = "\n".join([f"- {r}" for r in reasons])
                 return (
                     f"Thank you for applying. We are unable to approve your loan request of **₹{req:,.0f}** at this time.\n\n"
-                    f"**Primary Key Reason(s):**\n"
-                    f"{reasons_formatted}"
+                    f"**Primary Key Reason(s):**\n{reasons_formatted}\n\n"
+                    f"💡 **How to Improve Eligibility:**\n{improvements_formatted}"
                 )
 
     return "Session complete."
