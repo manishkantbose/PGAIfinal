@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import re
+import datetime
 import numpy as np
 import pandas as pd
 from groq import Groq
@@ -51,8 +52,23 @@ if not GROQ_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==============================================================================
-# 2. MASTER CATALOGS & HARMONIZED THRESHOLDS
+# 2. MASTER CATALOGS & AUDIT LOGGING SYSTEM
 # ==============================================================================
+AUDIT_LOG_FILE = "audit_logs.jsonl"
+
+def record_audit_log(event_type: str, payload: dict):
+    """Appends an audit log entry with timestamp to a persistent JSONL file."""
+    log_entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "event_type": event_type,
+        "data": payload
+    }
+    try:
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception:
+        pass
+
 EARLY_APPROVE_THRESH = 0.30
 EARLY_DECLINE_THRESH = 0.70
 FINAL_DECISION_THRESH = 0.44
@@ -417,6 +433,13 @@ def process_chat_message(user_input: str):
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             reasons, improvements = generate_explained_decline_analysis(p1_data, p2_data, hard_reasons)
             
+            record_audit_log("LOAN_HARD_DECLINE", {
+                "p1_data": p1_data,
+                "p2_data": p2_data,
+                "reasons": reasons,
+                "counter_offer": offer
+            })
+
             reasons_formatted = "\n".join([f"- {r}" for r in reasons])
             improvements_formatted = "\n".join([f"- {i}" for i in improvements])
 
@@ -440,11 +463,23 @@ def process_chat_message(user_input: str):
         
         if p1_risk <= EARLY_APPROVE_THRESH:
             state["step"] = "COMPLETED"
+            record_audit_log("PHASE_1_INSTANT_APPROVAL", {
+                "p1_data": p1_data,
+                "risk_score": p1_risk
+            })
             return f"🎉 Excellent news! Your loan request of **₹{p1_data['requested_loan_amount']:,.0f}** for the **{p1_data.get('Model_Variant', 'vehicle')}** is **INSTANTLY PRE-APPROVED**!"
         elif p1_risk >= EARLY_DECLINE_THRESH:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
             state["step"] = "COMPLETED"
             reasons, improvements = generate_explained_decline_analysis(p1_data, p2_data)
+            
+            record_audit_log("PHASE_1_DECLINE", {
+                "p1_data": p1_data,
+                "risk_score": p1_risk,
+                "reasons": reasons,
+                "counter_offer": offer
+            })
+
             reasons_formatted = "\n".join([f"- {r}" for r in reasons])
             improvements_formatted = "\n".join([f"- {i}" for i in improvements])
 
@@ -480,8 +515,17 @@ def process_chat_message(user_input: str):
         state["step"] = "COMPLETED"
         
         req = p1_data["requested_loan_amount"]
+        is_approved = (final_risk < FINAL_DECISION_THRESH and not is_hard_stop)
 
-        if final_risk < FINAL_DECISION_THRESH and not is_hard_stop:
+        record_audit_log("FINAL_DECISION", {
+            "status": "APPROVED" if is_approved else "DECLINED",
+            "risk_score": final_risk,
+            "p1_data": p1_data,
+            "p2_data": p2_data,
+            "hard_stop": is_hard_stop
+        })
+
+        if is_approved:
             return f"🎉 Congratulations! Your loan request of **₹{req:,.0f}** has been **FULLY APPROVED**."
         else:
             offer = calculate_max_eligible_loan(ml_model, p1_data, p2_data)
@@ -531,6 +575,19 @@ if st.sidebar.button("🔄 Reset / Start Over"):
 
 with st.sidebar.expander("🛠️ Developer Debugger", expanded=False):
     st.json(st.session_state.chatbot_state)
+
+with st.sidebar.expander("📜 Audit Logs Viewer", expanded=False):
+    if st.button("Refresh Logs"):
+        st.rerun()
+    try:
+        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+            logs = [json.loads(line) for line in f.readlines()]
+            if logs:
+                st.dataframe(pd.DataFrame(logs))
+            else:
+                st.info("Log file is empty.")
+    except FileNotFoundError:
+        st.info("No audit logs recorded yet.")
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
