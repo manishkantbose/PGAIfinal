@@ -53,12 +53,10 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 # ==============================================================================
 # 2. MASTER CATALOGS & HARMONIZED THRESHOLDS
 # ==============================================================================
-# Phase 1 Decision Thresholds (Harmonized with Code 2)
 EARLY_APPROVE_THRESH = 0.30
 EARLY_DECLINE_THRESH = 0.70
 FINAL_DECISION_THRESH = 0.44
 
-# Strict Hard Underwriting Policy Limits
 MAX_HARD_STOP_LTV = 100.0    # Hard rejection if LTV > 100%
 TARGET_POLICY_LTV = 80.0     # Safe underwriting baseline target
 MIN_MONTHLY_INCOME = 1000.0  # Minimum income floor
@@ -136,7 +134,6 @@ def load_underwriting_model():
 ml_model, MODEL_COLUMNS = load_underwriting_model()
 
 def check_over_invoicing(p1_data: dict) -> bool:
-    """Verifies if vehicle price exceeds the benchmark maximum threshold."""
     price = float(p1_data.get('vehicle_price', 0))
     make = p1_data.get('Make_Code')
     variant = p1_data.get('Model_Variant')
@@ -173,8 +170,6 @@ def build_model_features(p1_data: dict, p2_data: dict = None) -> pd.DataFrame:
     salary = float(p2_data.get('monthly_income', 50000))
     
     ltv = (req_loan / price * 100.0) if price > 0 else 100.0
-    
-    # Correction: Monthly Salary Ratio (Harmonized with Code 2)
     loan_to_salary = req_loan / (salary + 1.0)
     prem_score = calculate_premium_score(p1_data.get('model_description', ''))
     
@@ -197,19 +192,15 @@ def build_model_features(p1_data: dict, p2_data: dict = None) -> pd.DataFrame:
 def predict_risk(model, df_features: pd.DataFrame, model_columns: list, is_over_invoiced: bool = False) -> float:
     aligned_df = df_features.reindex(columns=model_columns, fill_value=0).astype(np.float32)
     base_risk = float(model.predict_proba(aligned_df)[0][1])
-    
-    # Penalty adjustment for over-invoiced quotations (Harmonized with Code 2)
     penalty = 0.15 if is_over_invoiced else 0.0
     return min(1.0, base_risk + penalty)
 
 def evaluate_hard_policy_stops(p1_data: dict, p2_data: dict = None) -> tuple:
-    """Evaluates strict non-negotiable underwriting rules."""
     reasons = []
     req_loan = float(p1_data.get('requested_loan_amount', 0))
     price = float(p1_data.get('vehicle_price', 1))
     ltv = (req_loan / price * 100.0) if price > 0 else 0.0
 
-    # Rule 1: High LTV Cap Stop
     if ltv > MAX_HARD_STOP_LTV:
         reasons.append(
             f"Loan-to-Value (LTV) ratio is **{ltv:.1f}%**, which exceeds our maximum permissible policy limit of **{MAX_HARD_STOP_LTV:.0f}%** "
@@ -221,19 +212,16 @@ def evaluate_hard_policy_stops(p1_data: dict, p2_data: dict = None) -> tuple:
         age = p2_data.get('age')
         emp_type = p2_data.get('Employment_Type', '')
 
-        # Rule 2: Minimum Income Floor
         if income < MIN_MONTHLY_INCOME:
             reasons.append(
                 f"Reported monthly income of **₹{income:,.0f}** is below our minimum policy floor of **₹{MIN_MONTHLY_INCOME:,.0f}**."
             )
 
-        # Rule 3: Age Limits
         if age is not None and (int(age) < MIN_AGE or int(age) > MAX_AGE):
             reasons.append(
                 f"Applicant age (**{age} years**) falls outside our eligible policy age bracket ({MIN_AGE} to {MAX_AGE} years)."
             )
 
-        # Rule 4: Non-Earning Category
         if emp_type in ['STU', 'NONEARNMEM']:
             reasons.append(
                 "Employment category falls under non-earning status (Student / Non-Working Member), requiring a primary earning co-applicant."
@@ -245,7 +233,6 @@ def evaluate_hard_policy_stops(p1_data: dict, p2_data: dict = None) -> tuple:
 # 4. COUNTER-OFFER & REASON GENERATOR LOGIC
 # ==============================================================================
 def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
-    """Calculates maximum approved loan amount using binary search capped at target LTV."""
     req_loan = float(p1_data.get('requested_loan_amount', 0))
     vehicle_price = float(p1_data.get('vehicle_price', 1))
     is_over_invoiced = check_over_invoicing(p1_data)
@@ -278,7 +265,6 @@ def calculate_max_eligible_loan(model, p1_data: dict, p2_data: dict) -> dict:
     }
 
 def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_reasons: list = None) -> tuple:
-    """Generates dynamic decision reasons and actionable improvement advice."""
     reasons = hard_stop_reasons.copy() if hard_stop_reasons else []
     improvements = []
 
@@ -291,7 +277,6 @@ def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_
     max_target_loan = price * (TARGET_POLICY_LTV / 100.0)
     extra_downpayment_needed = max(0.0, req_loan - max_target_loan)
 
-    # LTV Evaluation
     if ltv > TARGET_POLICY_LTV:
         if ltv <= MAX_HARD_STOP_LTV:
             reasons.append(f"LTV ratio of **{ltv:.1f}%** exceeds target policy limit of **{TARGET_POLICY_LTV:.0f}%**.")
@@ -301,17 +286,14 @@ def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_
                 f"to adjust the loan to ₹{max_target_loan:,.0f} (80% LTV)."
             )
 
-    # Debt-to-Income Check
     if income > 0 and (req_loan / income) > 3.0:
         reasons.append(f"Requested loan amount is high relative to net monthly income ({req_loan / income:.1f}x monthly income).")
         improvements.append("**Add Co-Applicant:** Include an earning co-applicant to increase total recognized household income.")
 
-    # Over-Invoicing Evaluation
     if check_over_invoicing(p1_data):
         reasons.append("Vehicle quotation exceeds maximum market benchmark price for this variant.")
         improvements.append("**Review Quotation:** Verify dealer invoice price against standard market benchmark.")
 
-    # Prior Active Debt Check
     if active_loans == 1:
         reasons.append("Active prior loan obligations increase overall credit risk.")
         improvements.append("**Clear Existing Debt:** Pay off active EMIs or short-term loans to reduce debt burden.")
@@ -429,7 +411,6 @@ def process_chat_message(user_input: str):
         if missing_p1_mand:
             return format_prompt_question(missing_p1_mand, missing_p1_opt)
         
-        # Hard Stop Policy Check (e.g., LTV > 100%)
         is_hard_stop, hard_reasons = evaluate_hard_policy_stops(p1_data)
         if is_hard_stop:
             state["step"] = "COMPLETED"
@@ -492,7 +473,6 @@ def process_chat_message(user_input: str):
         if missing_p2_mand:
             return format_prompt_question(missing_p2_mand, missing_optional=[])
         
-        # Hard Stop Policy Check in Phase 2
         is_hard_stop, hard_reasons = evaluate_hard_policy_stops(p1_data, p2_data)
         is_over_invoiced = check_over_invoicing(p1_data)
         full_features = build_model_features(p1_data, p2_data)
