@@ -52,7 +52,7 @@ if not GROQ_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ==============================================================================
-# 2. MASTER CATALOGS & AUDIT LOGGING SYSTEM
+# 2. MASTER CATALOGS & COMPREHENSIVE AUDIT LOGGING SYSTEM
 # ==============================================================================
 AUDIT_LOG_FILE = "audit_logs.jsonl"
 
@@ -371,8 +371,16 @@ def extract_all_slots(user_input: str, current_state: dict, last_assistant_messa
             response_format={"type": "json_object"},
             temperature=0.0
         )
-        return json.loads(response.choices[0].message.content)
-    except Exception:
+        extracted_data = json.loads(response.choices[0].message.content)
+        
+        # --- AUDIT LOG EXTRACTION EVENT ---
+        record_audit_log("SLOT_EXTRACTION", {
+            "user_input": user_input,
+            "extracted_slots": extracted_data
+        })
+        return extracted_data
+    except Exception as e:
+        record_audit_log("SLOT_EXTRACTION_ERROR", {"error": str(e), "user_input": user_input})
         return {}
 
 def format_prompt_question(missing_mandatory: list, missing_optional: list) -> str:
@@ -552,10 +560,12 @@ def process_chat_message(user_input: str):
     return "Session complete."
 
 def reset_application():
+    initial_msg = "👋 Welcome to ABC Credit! Which vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"
     st.session_state.messages = [
-        {"role": "assistant", "content": "👋 Welcome to ABC Credit! Which vehicle model/variant are you looking to buy, what is its on-road price, and how much loan do you need?"}
+        {"role": "assistant", "content": initial_msg}
     ]
     st.session_state.chatbot_state = {"step": "PHASE_1_COLLECTION", "p1_data": {}, "p2_data": {}}
+    record_audit_log("SESSION_RESET", {"initial_message": initial_msg})
 
 # ==============================================================================
 # 7. CHAT UI INTERFACE
@@ -577,17 +587,23 @@ with st.sidebar.expander("🛠️ Developer Debugger", expanded=False):
     st.json(st.session_state.chatbot_state)
 
 with st.sidebar.expander("📜 Audit Logs Viewer", expanded=False):
-    if st.button("Refresh Logs"):
-        st.rerun()
-    try:
-        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
-            logs = [json.loads(line) for line in f.readlines()]
-            if logs:
-                st.dataframe(pd.DataFrame(logs))
-            else:
-                st.info("Log file is empty.")
-    except FileNotFoundError:
-        st.info("No audit logs recorded yet.")
+    admin_pass = st.text_input("Enter Admin Password", type="password")
+    
+    # Change "admin123" to your preferred password or hook it to st.secrets
+    if admin_pass == "admin123":
+        if st.button("Refresh Logs"):
+            st.rerun()
+        try:
+            with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+                logs = [json.loads(line) for line in f.readlines()]
+                if logs:
+                    st.dataframe(pd.DataFrame(logs))
+                else:
+                    st.info("Log file is empty.")
+        except FileNotFoundError:
+            st.info("No audit logs recorded yet.")
+    elif admin_pass:
+        st.error("Incorrect password.")
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -602,12 +618,16 @@ if is_completed:
         st.rerun()
 else:
     if prompt := st.chat_input("Type your response here..."):
+        # Log user query
+        record_audit_log("USER_CHAT_MESSAGE", {"message": prompt})
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
         with st.spinner("Processing response..."):
             bot_response = process_chat_message(prompt)
             
+        # Log assistant response
+        record_audit_log("ASSISTANT_CHAT_RESPONSE", {"message": bot_response})
         st.session_state.messages.append({"role": "assistant", "content": bot_response})
         st.chat_message("assistant").write(bot_response)
         st.rerun()
