@@ -308,9 +308,9 @@ def generate_explained_decline_analysis(p1_data: dict, p2_data: dict, hard_stop_
                 f"to adjust the loan to ₹{max_target_loan:,.0f} (80% LTV)."
             )
 
-    if income > 0 and (req_loan / income) > 3.0:
-        reasons.append(f"Requested loan amount is high relative to net monthly income ({req_loan / income:.1f}x monthly income).")
-        improvements.append("**Add Co-Applicant:** Include an earning co-applicant to increase total recognized household income.")
+    #if income > 0 and (req_loan / income) > 3.0:
+     #   reasons.append(f"Requested loan amount is high relative to net monthly income ({req_loan / income:.1f}x monthly income).")
+     #   improvements.append("**Add Co-Applicant:** Include an earning co-applicant to increase total recognized household income.")
 
     if check_over_invoicing(p1_data):
         reasons.append("Vehicle quotation exceeds maximum market benchmark price for this variant.")
